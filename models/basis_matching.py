@@ -47,6 +47,7 @@ def inplace_clipping(matrix, clip):
 
 
 def check_approx_error(L, target):
+    """Compute the relative squared error."""
     encode = torch.matmul(target, L)  # n x k
     decode = torch.matmul(encode, L.t())
     error = torch.sum(torch.square(target - decode))
@@ -57,22 +58,25 @@ def check_approx_error(L, target):
 
 
 def get_bases(pub_grad, num_bases, power_iter=1, logging=False):
-    """QR algorithm for finding top-k eigenvalues."""
-    # The complexity (in non-parallelizable iteration count) is:
-    #   power_iter * m
+    """QR algorithm for finding top-k eigenvalues.
+
+    Returns:
+        L: Tensor of selected basis of size (k, k).
+        error_rate: Tensor of size (1,) for relative tolerance.
+    """
+    # The complexity (in non-parallelizable iteration count) is: power_iter * m
     num_p = pub_grad.shape[1]
     num_bases = min(num_bases, num_p)
-    L = torch.normal(0, 1.0, size=(num_p, num_bases), device=pub_grad.device)
+    L = torch.normal(mean=0, std=1.0, size=(num_p, num_bases), device=pub_grad.device)
     for i in range(power_iter):
         R = torch.matmul(pub_grad, L)  # np, pk -> nk
-        L = torch.matmul(pub_grad.t(), R)  # kn, nk -> k,k
-        orthogonalize(L)
+        L = torch.matmul(pub_grad.t(), R)  # pn, nk -> pk
+        orthogonalize(L)  # pk; orthonormalize the columns.
     error_rate = check_approx_error(L, pub_grad)
-    return L, num_bases, error_rate
+    return L, error_rate
 
 
 class GEP(nn.Module):
-
     def __init__(self, num_bases, batch_size, clip0=1, clip1=1, power_iter=1):
         super(GEP, self).__init__()
 
@@ -110,6 +114,7 @@ class GEP(nn.Module):
         else:
             return torch.cat(grad_list)
 
+    @torch.enable_grad()
     def get_anchor_gradients(self, net, loss_func):
         """Get the n x p matrix of gradients based on public data."""
         public_inputs, public_targets = self.public_inputs, self.public_targets
@@ -123,38 +128,39 @@ class GEP(nn.Module):
             del p.grad_batch
         return flatten_tensor(cur_batch_grad_list)  # n x p
 
+    @torch.no_grad()
     def get_anchor_space(self, net, loss_func, logging=False):
         anchor_grads = self.get_anchor_gradients(net, loss_func)
 
-        with torch.no_grad():
-            num_param_list = self.num_param_list
+        num_param_list = self.num_param_list
 
-            selected_bases_list = []
-            pub_errs = []
+        selected_bases_list = []
+        pub_errs = []
 
-            sqrt_num_param_list = np.sqrt(np.array(num_param_list))
-            num_bases_list = self.num_bases * (sqrt_num_param_list / np.sum(sqrt_num_param_list))
-            num_bases_list = num_bases_list.astype(np.int)
+        # This is a parameter grouping heuristic detailed in Appendix B.
+        # The motivation is to reduce the cost of power iteration. (mostly memory)
+        sqrt_num_param_list = np.sqrt(np.array(num_param_list))
+        num_bases_list = self.num_bases * (sqrt_num_param_list / np.sum(sqrt_num_param_list))
+        num_bases_list = num_bases_list.astype(np.int)
 
-            offset = 0
+        offset = 0
+        for i, (num_param, num_bases) in enumerate(
+            zip(num_param_list, num_bases_list)
+        ):
+            # Get the current group.
+            pub_grad = anchor_grads[:, offset:offset + num_param]
+            offset += num_param
 
-            for i, num_param in enumerate(num_param_list):
-                pub_grad = anchor_grads[:, offset:offset + num_param]
-                offset += num_param
+            # Get the top eigen-space of this set of coordinates.
+            selected_bases, pub_error = get_bases(
+                pub_grad, num_bases, self.power_iter, logging
+            )
+            pub_errs.append(pub_error)
+            selected_bases_list.append(selected_bases)
 
-                num_bases = num_bases_list[i]
-
-                selected_bases, num_bases, pub_error = get_bases(
-                    pub_grad, num_bases, self.power_iter, logging
-                )
-                pub_errs.append(pub_error)
-
-                num_bases_list[i] = num_bases
-                selected_bases_list.append(selected_bases)
-
-            self.selected_bases_list = selected_bases_list
-            self.num_bases_list = num_bases_list
-            self.approx_errors = pub_errs
+        self.selected_bases_list = selected_bases_list
+        self.num_bases_list = num_bases_list
+        self.approx_errors = pub_errs
         del anchor_grads
 
     @torch.no_grad()
