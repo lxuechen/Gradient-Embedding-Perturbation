@@ -1,17 +1,15 @@
 import numpy as np
 import torch
 import torch.nn as nn
-# package for computing individual gradients
 from backpack import backpack
 from backpack.extensions import BatchGrad
 
 
 def flatten_tensor(tensor_list):
-    for i in range(len(tensor_list)):
-        tensor_list[i] = tensor_list[i].reshape([tensor_list[i].shape[0], -1])
-    flatten_param = torch.cat(tensor_list, dim=1)
-    del tensor_list
-    return flatten_param
+    """Flatten and concat along non-batch dimensions."""
+    return torch.cat(
+        [t.flatten(start_dim=1) for t in tensor_list], dim=1
+    )
 
 
 @torch.jit.script
@@ -119,26 +117,23 @@ class GEP(nn.Module):
             loss.backward()
         cur_batch_grad_list = []
         for p in net.parameters():
-            cur_batch_grad_list.append(p.grad_batch.reshape(p.grad_batch.shape[0], -1))
+            cur_batch_grad_list.append(p.grad_batch)
             del p.grad_batch
-        return flatten_tensor(cur_batch_grad_list)
+        return flatten_tensor(cur_batch_grad_list)  # (n, p)
 
     def get_anchor_space(self, net, loss_func, logging=False):
         anchor_grads = self.get_anchor_gradients(net, loss_func)
+
         with torch.no_grad():
             num_param_list = self.num_param_list
-            num_anchor_grads = anchor_grads.shape[0]
-            num_group_p = len(num_param_list)
 
             selected_bases_list = []
-            num_bases_list = []
             pub_errs = []
 
             sqrt_num_param_list = np.sqrt(np.array(num_param_list))
             num_bases_list = self.num_bases * (sqrt_num_param_list / np.sum(sqrt_num_param_list))
             num_bases_list = num_bases_list.astype(np.int)
 
-            total_p = 0
             offset = 0
 
             for i, num_param in enumerate(num_param_list):
@@ -177,7 +172,7 @@ class GEP(nn.Module):
                     cur_target = torch.mean(grad, dim=0)
                     cur_error = torch.sum(torch.square(cur_approx - cur_target)) / torch.sum(torch.square(cur_target))
                     print('group %d, param: %d, num of bases: %d, group wise approx error: %.2f%%' % (
-                    i, num_param, self.num_bases_list[i], 100 * cur_error.item()))
+                        i, num_param, self.num_bases_list[i], 100 * cur_error.item()))
                     if (i in self.approx_error):
                         self.approx_error[i].append(cur_error.item())
                     else:
