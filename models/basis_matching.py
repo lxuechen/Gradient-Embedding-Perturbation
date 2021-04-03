@@ -14,24 +14,23 @@ def flatten_tensor(tensor_list):
 
 @torch.jit.script
 def orthogonalize(matrix):
+    """Gram-Schmidt orthogonalization procedure."""
     n, m = matrix.shape
     for i in range(m):
-        # Normalize the i'th column
+        # Normalize the ith column.
         col = matrix[:, i: i + 1]
         col /= torch.sqrt(torch.sum(col ** 2))
-        # Project it on the rest and remove it
+        # Project it on the rest and remove it.
         if i + 1 < m:
             rest = matrix[:, i + 1:]
-            # rest -= torch.matmul(col.t(), rest) * col
             rest -= torch.sum(col * rest, dim=0) * col
 
 
 def clip_column(tsr, clip=1.0, inplace=True):
-    if (inplace):
+    if inplace:
         inplace_clipping(tsr, torch.tensor(clip).cuda())
     else:
         norms = torch.norm(tsr, dim=1)
-
         scale = torch.clamp(clip / norms, max=1.0)
         return tsr * scale.view(-1, 1)
 
@@ -43,29 +42,30 @@ def inplace_clipping(matrix, clip):
         # Normalize the i'th row
         col = matrix[i:i + 1, :]
         col_norm = torch.sqrt(torch.sum(col ** 2))
-        if (col_norm > clip):
+        if col_norm > clip:
             col /= (col_norm / clip)
 
 
 def check_approx_error(L, target):
     encode = torch.matmul(target, L)  # n x k
-    decode = torch.matmul(encode, L.T)
+    decode = torch.matmul(encode, L.t())
     error = torch.sum(torch.square(target - decode))
     target = torch.sum(torch.square(target))
-    if (target.item() == 0):
+    if target.item() == 0:
         return -1
     return error.item() / target.item()
 
 
 def get_bases(pub_grad, num_bases, power_iter=1, logging=False):
-    num_k = pub_grad.shape[0]
+    """QR algorithm for finding top-k eigenvalues."""
+    # The complexity (in non-parallelizable iteration count) is:
+    #   power_iter * m
     num_p = pub_grad.shape[1]
-
     num_bases = min(num_bases, num_p)
-    L = torch.normal(0, 1.0, size=(pub_grad.shape[1], num_bases), device=pub_grad.device)
+    L = torch.normal(0, 1.0, size=(num_p, num_bases), device=pub_grad.device)
     for i in range(power_iter):
-        R = torch.matmul(pub_grad, L)  # n x k
-        L = torch.matmul(pub_grad.T, R)  # p x k
+        R = torch.matmul(pub_grad, L)  # np, pk -> nk
+        L = torch.matmul(pub_grad.t(), R)  # kn, nk -> k,k
         orthogonalize(L)
     error_rate = check_approx_error(L, pub_grad)
     return L, num_bases, error_rate
@@ -76,7 +76,7 @@ class GEP(nn.Module):
     def __init__(self, num_bases, batch_size, clip0=1, clip1=1, power_iter=1):
         super(GEP, self).__init__()
 
-        self.num_bases = num_bases
+        self.num_bases = num_bases  # The k for top-k subspace.
         self.clip0 = clip0
         self.clip1 = clip1
         self.power_iter = power_iter
@@ -97,8 +97,9 @@ class GEP(nn.Module):
 
         for i, bases in enumerate(bases_list):
             num_bases = num_bases_list[i]
-
-            grad = torch.matmul(embedding[:, offset:offset + num_bases].view(bs, -1), bases.T)
+            grad = torch.matmul(
+                embedding[:, offset:offset + num_bases].view(bs, -1), bases.T
+            )
             if bs > 1:
                 grad_list.append(grad.view(bs, -1))
             else:
@@ -110,6 +111,7 @@ class GEP(nn.Module):
             return torch.cat(grad_list)
 
     def get_anchor_gradients(self, net, loss_func):
+        """Get the n x p matrix of gradients based on public data."""
         public_inputs, public_targets = self.public_inputs, self.public_targets
         outputs = net(public_inputs)
         loss = loss_func(outputs, public_targets)
@@ -119,7 +121,7 @@ class GEP(nn.Module):
         for p in net.parameters():
             cur_batch_grad_list.append(p.grad_batch)
             del p.grad_batch
-        return flatten_tensor(cur_batch_grad_list)  # (n, p)
+        return flatten_tensor(cur_batch_grad_list)  # n x p
 
     def get_anchor_space(self, net, loss_func, logging=False):
         anchor_grads = self.get_anchor_gradients(net, loss_func)
@@ -142,7 +144,9 @@ class GEP(nn.Module):
 
                 num_bases = num_bases_list[i]
 
-                selected_bases, num_bases, pub_error = get_bases(pub_grad, num_bases, self.power_iter, logging)
+                selected_bases, num_bases, pub_error = get_bases(
+                    pub_grad, num_bases, self.power_iter, logging
+                )
                 pub_errs.append(pub_error)
 
                 num_bases_list[i] = num_bases
@@ -153,52 +157,51 @@ class GEP(nn.Module):
             self.approx_errors = pub_errs
         del anchor_grads
 
+    @torch.no_grad()
     def forward(self, target_grad, logging=False):
-        with torch.no_grad():
-            num_param_list = self.num_param_list
-            embedding_list = []
+        num_param_list = self.num_param_list
+        embedding_list = []
 
-            offset = 0
-            if (logging):
-                print('group wise approx error')
+        offset = 0
+        if logging:
+            print('group wise approx error')
 
-            for i, num_param in enumerate(num_param_list):
-                grad = target_grad[:, offset:offset + num_param]
-                selected_bases = self.selected_bases_list[i]
-                embedding = torch.matmul(grad, selected_bases)
-                num_bases = self.num_bases_list[i]
-                if (logging):
-                    cur_approx = torch.matmul(torch.mean(embedding, dim=0).view(1, -1), selected_bases.T).view(-1)
-                    cur_target = torch.mean(grad, dim=0)
-                    cur_error = torch.sum(torch.square(cur_approx - cur_target)) / torch.sum(torch.square(cur_target))
-                    print('group %d, param: %d, num of bases: %d, group wise approx error: %.2f%%' % (
-                        i, num_param, self.num_bases_list[i], 100 * cur_error.item()))
-                    if (i in self.approx_error):
-                        self.approx_error[i].append(cur_error.item())
-                    else:
-                        self.approx_error[i] = []
-                        self.approx_error[i].append(cur_error.item())
+        for i, num_param in enumerate(num_param_list):
+            grad = target_grad[:, offset:offset + num_param]
+            selected_bases = self.selected_bases_list[i]
+            embedding = torch.matmul(grad, selected_bases)
+            if logging:
+                cur_approx = torch.matmul(torch.mean(embedding, dim=0).view(1, -1), selected_bases.T).view(-1)
+                cur_target = torch.mean(grad, dim=0)
+                cur_error = torch.sum(torch.square(cur_approx - cur_target)) / torch.sum(torch.square(cur_target))
+                print('group %d, param: %d, num of bases: %d, group wise approx error: %.2f%%' % (
+                    i, num_param, self.num_bases_list[i], 100 * cur_error.item()))
+                if (i in self.approx_error):
+                    self.approx_error[i].append(cur_error.item())
+                else:
+                    self.approx_error[i] = []
+                    self.approx_error[i].append(cur_error.item())
 
-                embedding_list.append(embedding)
-                offset += num_param
+            embedding_list.append(embedding)
+            offset += num_param
 
-            concatnated_embedding = torch.cat(embedding_list, dim=1)
-            clipped_embedding = clip_column(concatnated_embedding, clip=self.clip0, inplace=False)
-            if (logging):
-                norms = torch.norm(clipped_embedding, dim=1)
-                print('average norm of clipped embedding: ', torch.mean(norms).item(), 'max norm: ',
-                      torch.max(norms).item(), 'median norm: ', torch.median(norms).item())
-            avg_clipped_embedding = torch.sum(clipped_embedding, dim=0) / self.batch_size
+        concatenated_embedding = torch.cat(embedding_list, dim=1)
+        clipped_embedding = clip_column(concatenated_embedding, clip=self.clip0, inplace=False)
+        if logging:
+            norms = torch.norm(clipped_embedding, dim=1)
+            print('average norm of clipped embedding: ', torch.mean(norms).item(), 'max norm: ',
+                  torch.max(norms).item(), 'median norm: ', torch.median(norms).item())
+        avg_clipped_embedding = torch.sum(clipped_embedding, dim=0) / self.batch_size
 
-            no_reduction_approx = self.get_approx_grad(concatnated_embedding)
-            residual_gradients = target_grad - no_reduction_approx
-            clip_column(residual_gradients, clip=self.clip1)  # inplace clipping to save memory
-            clipped_residual_gradients = residual_gradients
-            if (logging):
-                norms = torch.norm(clipped_residual_gradients, dim=1)
-                print('average norm of clipped residual gradients: ', torch.mean(norms).item(), 'max norm: ',
-                      torch.max(norms).item(), 'median norm: ', torch.median(norms).item())
+        no_reduction_approx = self.get_approx_grad(concatenated_embedding)
+        residual_gradients = target_grad - no_reduction_approx
+        clip_column(residual_gradients, clip=self.clip1)  # inplace clipping to save memory
+        clipped_residual_gradients = residual_gradients
+        if logging:
+            norms = torch.norm(clipped_residual_gradients, dim=1)
+            print('average norm of clipped residual gradients: ', torch.mean(norms).item(), 'max norm: ',
+                  torch.max(norms).item(), 'median norm: ', torch.median(norms).item())
 
-            avg_clipped_residual_gradients = torch.sum(clipped_residual_gradients, dim=0) / self.batch_size
-            avg_target_grad = torch.sum(target_grad, dim=0) / self.batch_size
-            return avg_clipped_embedding.view(-1), avg_clipped_residual_gradients.view(-1), avg_target_grad.view(-1)
+        avg_clipped_residual_gradients = torch.sum(clipped_residual_gradients, dim=0) / self.batch_size
+        avg_target_grad = torch.sum(target_grad, dim=0) / self.batch_size
+        return avg_clipped_embedding.view(-1), avg_clipped_residual_gradients.view(-1), avg_target_grad.view(-1)
